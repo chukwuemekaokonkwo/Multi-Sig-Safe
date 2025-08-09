@@ -79,6 +79,22 @@
   }
 )
 
+;; INPUT VALIDATION HELPERS
+
+(define-private (is-valid-principal (address principal))
+  (not (is-eq address 'SP000000000000000000002Q6VF78)))
+
+(define-private (is-valid-description (desc (optional (buff 256))))
+  (match desc
+    some-desc (and (>= (len some-desc) u1) (<= (len some-desc) u256))
+    true))
+
+(define-private (is-valid-proposal-id (proposal-id uint))
+  (< proposal-id (var-get next-proposal-identifier)))
+
+(define-private (is-valid-duration-blocks (duration uint))
+  (and (> duration u0) (<= duration u52560))) ;; Max ~1 year in blocks
+
 ;; ON-CHAIN FUNCTIONALITIES
 
 ;; TREASURY INITIALIZATION
@@ -89,6 +105,10 @@
     (asserts! (is-eq (var-get active-guardian-count) u0) ERR-ACCESS-DENIED)
     (asserts! (<= minimum-approvals-required (len founding-guardians)) ERR-APPROVAL-REQUIREMENT-TOO-HIGH)
     (asserts! (> minimum-approvals-required u0) ERR-INVALID-INPUT-PARAMETER)
+    ;; Validate emergency guardian address
+    (asserts! (is-valid-principal emergency-guardian-address) ERR-INVALID-INPUT-PARAMETER)
+    ;; Validate all founding guardian addresses
+    (asserts! (is-eq (len (filter is-valid-principal founding-guardians)) (len founding-guardians)) ERR-INVALID-INPUT-PARAMETER)
     
     (var-set required-approval-threshold minimum-approvals-required)
     (var-set emergency-guardian emergency-guardian-address)
@@ -112,12 +132,16 @@
   (let ((current-proposal-id (var-get next-proposal-identifier))
         (guardian-info (unwrap! (map-get? treasury-guardians { guardian-principal: tx-sender }) ERR-ACCESS-DENIED)))
     
+    ;; Input validation
+    (asserts! (is-valid-principal recipient-address) ERR-INVALID-INPUT-PARAMETER)
+    (asserts! (is-valid-description description) ERR-INVALID-INPUT-PARAMETER)
+    (asserts! (is-valid-duration-blocks expiration-blocks) ERR-INVALID-INPUT-PARAMETER)
+    
     (asserts! (get is-active-guardian guardian-info) ERR-ACCESS-DENIED)
     (asserts! (not (var-get is-emergency-mode-active)) ERR-EMERGENCY-MODE-ACTIVE)
     (asserts! (> amount-micro-stx u0) ERR-INVALID-INPUT-PARAMETER)
     (asserts! (<= amount-micro-stx (stx-get-balance (as-contract tx-sender))) ERR-TREASURY-INSUFFICIENT-FUNDS)
     (asserts! (<= amount-micro-stx (get spending-limit guardian-info)) ERR-SPENDING-LIMIT-EXCEEDED)
-    (asserts! (> expiration-blocks u0) ERR-INVALID-INPUT-PARAMETER)
     
     (update-daily-spending amount-micro-stx)
     (asserts! (<= (var-get daily-spent-amount) (var-get daily-spending-limit)) ERR-SPENDING-LIMIT-EXCEEDED)
@@ -148,6 +172,9 @@
 ;; PROPOSAL VOTING
 (define-public (approve-proposal (proposal-id uint))
   (begin
+    ;; Validate proposal ID
+    (asserts! (is-valid-proposal-id proposal-id) ERR-PROPOSAL-NOT-FOUND)
+    
     (asserts! (is-authorized-guardian tx-sender) ERR-ACCESS-DENIED)
     (asserts! (is-some (map-get? governance-proposals { proposal-id: proposal-id })) ERR-PROPOSAL-NOT-FOUND)
     
@@ -178,6 +205,9 @@
 ;; PROPOSAL EXECUTION
 (define-public (execute-approved-proposal (proposal-id uint))
   (begin
+    ;; Validate proposal ID
+    (asserts! (is-valid-proposal-id proposal-id) ERR-PROPOSAL-NOT-FOUND)
+    
     (asserts! (is-some (map-get? governance-proposals { proposal-id: proposal-id })) ERR-PROPOSAL-NOT-FOUND)
     
     (match (map-get? governance-proposals { proposal-id: proposal-id })
@@ -204,6 +234,9 @@
 ;; GUARDIAN MANAGEMENT
 (define-public (propose-add-guardian (new-guardian-address principal))
   (let ((current-proposal-id (var-get next-proposal-identifier)))
+    ;; Validate guardian address
+    (asserts! (is-valid-principal new-guardian-address) ERR-INVALID-INPUT-PARAMETER)
+    
     (asserts! (is-authorized-guardian tx-sender) ERR-ACCESS-DENIED)
     (asserts! (not (is-authorized-guardian new-guardian-address)) ERR-GUARDIAN-ALREADY-REGISTERED)
     
@@ -228,6 +261,9 @@
 
 (define-public (execute-add-guardian (proposal-id uint))
   (begin
+    ;; Validate proposal ID
+    (asserts! (is-valid-proposal-id proposal-id) ERR-PROPOSAL-NOT-FOUND)
+    
     (asserts! (is-some (map-get? governance-proposals { proposal-id: proposal-id })) ERR-PROPOSAL-NOT-FOUND)
     
     (match (map-get? governance-proposals { proposal-id: proposal-id })
@@ -254,6 +290,10 @@
 (define-public (delegate-voting-power (delegate-to principal) (delegation-duration-blocks uint))
   (let ((delegator-info (unwrap! (map-get? treasury-guardians { guardian-principal: tx-sender }) ERR-ACCESS-DENIED))
         (delegate-info (unwrap! (map-get? treasury-guardians { guardian-principal: delegate-to }) ERR-GUARDIAN-NOT-REGISTERED)))
+    
+    ;; Input validation
+    (asserts! (is-valid-principal delegate-to) ERR-INVALID-INPUT-PARAMETER)
+    (asserts! (is-valid-duration-blocks delegation-duration-blocks) ERR-INVALID-INPUT-PARAMETER)
     
     (asserts! (get is-active-guardian delegator-info) ERR-ACCESS-DENIED)
     (asserts! (get is-active-guardian delegate-info) ERR-ACCESS-DENIED)
@@ -320,35 +360,43 @@
     (ok current-proposal-id)))
 
 (define-public (execute-threshold-change (proposal-id uint))
-  (match (map-get? governance-proposals { proposal-id: proposal-id })
-    proposal-details
-      (begin
-        (asserts! (is-eq (get proposal-type proposal-details) "threshold-change") ERR-INVALID-INPUT-PARAMETER)
-        (asserts! (>= (get current-approval-count proposal-details) (var-get required-approval-threshold)) ERR-ACCESS-DENIED)
-        (asserts! (>= block-height (get timelock-expiry-block proposal-details)) ERR-TIMELOCK-NOT-EXPIRED)
-        
-        (var-set required-approval-threshold (get transfer-amount-micro-stx proposal-details))
-        (map-set governance-proposals
-          { proposal-id: proposal-id }
-          (merge proposal-details { is-executed: true }))
-        (ok proposal-id))
-    ERR-PROPOSAL-NOT-FOUND))
+  (begin
+    ;; Validate proposal ID
+    (asserts! (is-valid-proposal-id proposal-id) ERR-PROPOSAL-NOT-FOUND)
+    
+    (match (map-get? governance-proposals { proposal-id: proposal-id })
+      proposal-details
+        (begin
+          (asserts! (is-eq (get proposal-type proposal-details) "threshold-change") ERR-INVALID-INPUT-PARAMETER)
+          (asserts! (>= (get current-approval-count proposal-details) (var-get required-approval-threshold)) ERR-ACCESS-DENIED)
+          (asserts! (>= block-height (get timelock-expiry-block proposal-details)) ERR-TIMELOCK-NOT-EXPIRED)
+          
+          (var-set required-approval-threshold (get transfer-amount-micro-stx proposal-details))
+          (map-set governance-proposals
+            { proposal-id: proposal-id }
+            (merge proposal-details { is-executed: true }))
+          (ok proposal-id))
+      ERR-PROPOSAL-NOT-FOUND)))
 
 ;; PROPOSAL CANCELLATION
 (define-public (cancel-proposal (proposal-id uint))
-  (match (map-get? governance-proposals { proposal-id: proposal-id })
-    proposal-details
-      (begin
-        (asserts! (not (get is-executed proposal-details)) ERR-PROPOSAL-ALREADY-EXECUTED)
-        (asserts! (not (get is-cancelled proposal-details)) ERR-PROPOSAL-ALREADY-REJECTED)
-        (asserts! (or (is-eq (get initiating-guardian proposal-details) tx-sender)
-                     (>= (get current-approval-count proposal-details) (var-get required-approval-threshold))) ERR-ACCESS-DENIED)
-        
-        (map-set governance-proposals
-          { proposal-id: proposal-id }
-          (merge proposal-details { is-cancelled: true }))
-        (ok proposal-id))
-    ERR-PROPOSAL-NOT-FOUND))
+  (begin
+    ;; Validate proposal ID
+    (asserts! (is-valid-proposal-id proposal-id) ERR-PROPOSAL-NOT-FOUND)
+    
+    (match (map-get? governance-proposals { proposal-id: proposal-id })
+      proposal-details
+        (begin
+          (asserts! (not (get is-executed proposal-details)) ERR-PROPOSAL-ALREADY-EXECUTED)
+          (asserts! (not (get is-cancelled proposal-details)) ERR-PROPOSAL-ALREADY-REJECTED)
+          (asserts! (or (is-eq (get initiating-guardian proposal-details) tx-sender)
+                       (>= (get current-approval-count proposal-details) (var-get required-approval-threshold))) ERR-ACCESS-DENIED)
+          
+          (map-set governance-proposals
+            { proposal-id: proposal-id }
+            (merge proposal-details { is-cancelled: true }))
+          (ok proposal-id))
+      ERR-PROPOSAL-NOT-FOUND)))
 
 ;; HELPER FUNCTIONS
 
